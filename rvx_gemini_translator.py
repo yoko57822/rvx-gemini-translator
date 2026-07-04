@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 APP_NAME = "RVX Gemini Translator"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 DEFAULT_MODEL = "gemini-3.1-flash-lite"
 
 # RPG Maker VX / VX Ace data files where translating strings is usually meaningful.
@@ -72,6 +72,17 @@ TOKEN_PATTERN = re.compile(
 )
 
 FILE_EXT_RE = re.compile(r"\.(png|jpe?g|bmp|gif|ogg|wav|mp3|mid|midi|wma|dll|exe|rvdata2?|rxdata|rb|txt)$", re.I)
+
+# Ruby encoding names (from :encoding ivars) -> Python codec names.
+RUBY_ENCODING_ALIASES = {
+    "utf-8": "utf-8",
+    "windows-31j": "cp932",
+    "shift_jis": "cp932",
+    "cp932": "cp932",
+    "euc-jp": "euc_jp",
+    "us-ascii": "ascii",
+    "ascii-8bit": "latin-1",
+}
 CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7a3]")
 LETTER_RE = re.compile(r"[A-Za-z\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7a3]")
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
@@ -87,6 +98,14 @@ class RubyMarshalParseError(Exception):
 
 class TranslationCancelled(Exception):
     """Raised when the user requests a cooperative stop between batches/files."""
+
+
+class GeminiParseError(RuntimeError):
+    """The API answered, but the response could not be parsed as translations.
+
+    Distinguished from transport/SDK errors so only genuine parse failures trigger
+    the split-and-retry strategy instead of an endless retry cascade.
+    """
 
 
 @dataclasses.dataclass
@@ -361,6 +380,8 @@ class RubyMarshalParser:
             node = MarshalNode("hash" if tag == "{" else "hash_default", start, path=path)
             for i in range(count):
                 key = self._parse_value(path + (f"{{key{i}}}",))
+                # Hash keys are lookup identifiers; translating them breaks script lookups.
+                annotate_meta(key, "hash_key", True)
                 key_label = self._key_label(key, i)
                 val = self._parse_value(path + (f"{{{key_label}}}",))
                 node.children.extend([key, val])
@@ -385,6 +406,17 @@ class RubyMarshalParser:
                 node.fields.append((ivar, val))
                 node.children.append(val)
             node.end = self.pos
+            if obj.typ == "string":
+                # Ruby 1.9 (VX Ace) encoding ivars. :E false marks US-ASCII; replacing the
+                # payload with non-ASCII bytes requires flipping that flag to true, so keep
+                # a handle to the flag node. :encoding "name" strings are metadata, never
+                # translation candidates, and force re-encoding of any replacement.
+                for field_name, field_val in node.fields:
+                    if field_name == "E" and field_val.typ == "false":
+                        obj.meta["ascii_flag_node"] = field_val
+                    elif field_name == "encoding" and field_val.typ == "string" and field_val.text:
+                        obj.meta["ruby_encoding"] = field_val.text
+                        field_val.meta["is_encoding_name"] = True
             return node
         if tag == "o":
             node = MarshalNode("object", start, path=path)
@@ -513,9 +545,10 @@ def render_patched(data: bytes, node: MarshalNode) -> bytes:
         return bytes(out)
 
     if node.replacement_bytes is not None:
-        if node.typ != "string":
-            raise ValueError("Only string nodes can be directly replaced")
-        return b'"' + encode_ruby_long(len(node.replacement_bytes)) + node.replacement_bytes
+        if node.typ == "string":
+            return b'"' + encode_ruby_long(len(node.replacement_bytes)) + node.replacement_bytes
+        # Raw splice for non-string nodes, e.g. flipping an :E encoding flag F -> T.
+        return node.replacement_bytes
 
     if not node.is_modified():
         return data[node.start : node.end]
@@ -609,8 +642,12 @@ def looks_like_binary_or_asset(text: str) -> bool:
     if FILE_EXT_RE.search(stripped):
         return True
     asset_probe = TOKEN_PATTERN.sub("", stripped)
-    if "/" in asset_probe or "\\" in asset_probe:
-        # RPG Maker asset names often contain paths. Keep valid text control codes such as \N[1].
+    if "\\" in asset_probe:
+        # A backslash surviving token-stripping is an unrecognized control code.
+        return True
+    if "/" in asset_probe and not CJK_RE.search(asset_probe) and re.fullmatch(r"[\w\-./]+", asset_probe):
+        # Path-like: slash-separated identifier with no spaces/CJK, e.g. Audio/SE/Cursor.
+        # Ordinary text such as "HP/MPを回復" or "Attack/Defense up" must stay translatable.
         return True
     if len(stripped) > 3000:
         # Very large strings are often scripts or compressed-ish payloads.
@@ -660,6 +697,8 @@ def collect_candidates(
     result: list[TextCandidate] = []
     for node in parser.string_nodes:
         if node.text is None:
+            continue
+        if node.meta.get("hash_key") or node.meta.get("is_encoding_name"):
             continue
         path_text = normalize_path(node.path)
         if contains_excluded_asset_path(path_text):
@@ -722,11 +761,28 @@ def protect_tokens(text: str) -> tuple[str, dict[str, str]]:
 
 def restore_tokens(text: str, mapping: dict[str, str]) -> str:
     restored = text
-    # Gemini sometimes inserts spaces inside exotic brackets. Try exact first, then simple variants.
+    # Gemini sometimes inserts spaces inside the brackets, swaps bracket styles, or
+    # changes case. Try the exact placeholder first, then a tolerant pattern.
     for ph, token in mapping.items():
-        restored = restored.replace(ph, token)
-        restored = restored.replace(ph.replace("⟦", "[").replace("⟧", "]"), token)
+        if ph in restored:
+            restored = restored.replace(ph, token)
+            continue
+        digits = re.escape(ph[3:-1])  # ⟦PH{n}⟧ -> n
+        fuzzy = re.compile(r"[⟦\[\(【]\s*[Pp][Hh]\s*" + digits + r"\s*[⟧\]\)】]")
+        restored = fuzzy.sub(lambda _m, _t=token: _t, restored)
     return restored
+
+
+def tokens_restored_ok(restored: str, mapping: dict[str, str]) -> bool:
+    """True if every protected token survived the model round-trip."""
+    if not mapping:
+        return True
+    if "⟦" in restored or "⟧" in restored:
+        return False
+    needed: dict[str, int] = {}
+    for token in mapping.values():
+        needed[token] = needed.get(token, 0) + 1
+    return all(restored.count(token) >= count for token, count in needed.items())
 
 
 def restore_outer_whitespace(original: str, translated: str) -> str:
@@ -871,11 +927,8 @@ class GeminiBatchTranslator:
             return {}
         try:
             return self._translate_numbered_subset(all_sources, indices)
-        except Exception as exc:
+        except GeminiParseError as exc:
             msg = str(exc).replace("\n", " ")
-            lower_msg = msg.lower()
-            if not any(token in lower_msg for token in ("파싱", "parse", "json 응답", "응답 일부")):
-                raise
             if len(indices) <= 1:
                 self.log(f"항목 {indices[0] + 1} 파싱 실패로 원문 유지 예정: {msg[:220]}")
                 return {}
@@ -977,19 +1030,27 @@ class GeminiBatchTranslator:
 
         response_text = self._call_generate_content(prompt, config)
         try:
-            parsed_map = self._parse_translation_map(response_text, len(indices))
+            single_source = all_sources[indices[0]] if len(indices) == 1 else None
+            parsed_map = self._parse_translation_map(response_text, len(indices), single_source=single_source)
         except Exception as exc:
             preview = self._preview_response(response_text)
             saved = self._save_bad_response(response_text, len(indices))
             suffix = f" / 저장: {saved}" if saved else ""
-            raise RuntimeError(f"Gemini 번역 응답을 파싱할 수 없습니다. 응답 일부: {preview}{suffix}") from exc
+            raise GeminiParseError(f"Gemini 번역 응답을 파싱할 수 없습니다. 응답 일부: {preview}{suffix}") from exc
 
         out: dict[int, str] = {}
         for local_no, translated in parsed_map.items():
             global_idx = local_to_global.get(local_no)
             if global_idx is None:
                 continue
-            restored = restore_tokens(translated, token_maps.get(local_no, {}))
+            token_map = token_maps.get(local_no, {})
+            restored = restore_tokens(translated, token_map)
+            if not tokens_restored_ok(restored, token_map):
+                # A control-code placeholder was dropped or mangled; writing this would
+                # break color/name/variable codes in game. Leave it missing so the outer
+                # retry rounds request this item again.
+                self.log(f"주의: 항목 {local_no} 응답에서 제어 코드가 손상되어 해당 항목을 재요청합니다.")
+                continue
             restored = restore_outer_whitespace(all_sources[global_idx], restored)
             out[global_idx] = restored
         return out
@@ -1052,7 +1113,9 @@ class GeminiBatchTranslator:
                     time.sleep(sleep_s)
         raise RuntimeError(f"Gemini 요청 실패: {last_exc}")
 
-    def _parse_translation_map(self, text: str, expected_count: int) -> dict[int, str]:
+    def _parse_translation_map(
+        self, text: str, expected_count: int, single_source: Optional[str] = None
+    ) -> dict[int, str]:
         # 1) Strict/normal JSON: dict, {"translations": ...}, or array.
         try:
             parsed = self._parse_json_response(text)
@@ -1080,7 +1143,12 @@ class GeminiBatchTranslator:
         if fence:
             clean = fence.group(1).strip()
         if expected_count == 1 and clean and not clean.startswith(("{", "[")):
-            return {1: clean}
+            # Reject responses that are far longer than the source — those are usually
+            # refusals or explanations, not translations, and must not be cached.
+            limit = max(80, 3 * len(single_source) + 40) if single_source is not None else 200
+            multiline_ok = "\n" not in clean or "\n" in (single_source or "")
+            if len(clean) <= limit and multiline_ok:
+                return {1: clean}
 
         raise RuntimeError("Gemini 번역 응답을 파싱할 수 없습니다.")
 
@@ -1434,7 +1502,9 @@ def repair_asset_references(
 
     for file_path, cur_data, cur_root, changed_here in parsed_to_write:
         patched = render_patched(cur_data, cur_root)
-        file_path.write_bytes(patched)
+        tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+        tmp_path.write_bytes(patched)
+        tmp_path.replace(file_path)
         log(f"복구 저장 완료: {file_path.name} - {changed_here}개")
 
     files_changed = len(parsed_to_write)
@@ -1638,19 +1708,39 @@ def translate_game(
         for batch in other_batches:
             run_batch(batch)
 
-    # Apply translations to nodes. Encode all translated text as UTF-8; RPG Maker VX .rvdata normally accepts UTF-8 strings.
+    # Apply translations to nodes. UTF-8 by default; strings carrying an explicit Ruby
+    # :encoding ivar are re-encoded to that encoding, and US-ASCII (:E false) strings that
+    # become non-ASCII get their flag flipped to true so Ruby 1.9 (VX Ace) loads them.
     applied = 0
+    non_utf8_sources = 0
     for cand in all_candidates:
         translated = translations.get(cand.text)
         if translated is None:
             continue
         if translated == cand.text:
             continue
+        ruby_enc = cand.node.meta.get("ruby_encoding")
         try:
-            cand.node.replacement_bytes = translated.encode("utf-8")
-            applied += 1
-        except UnicodeEncodeError as exc:
-            report.warnings.append(f"UTF-8 인코딩 실패: {cand.file_path.name} {cand.path_text}: {exc}")
+            if ruby_enc:
+                codec = RUBY_ENCODING_ALIASES.get(ruby_enc.lower(), ruby_enc)
+                encoded = translated.encode(codec)
+            else:
+                encoded = translated.encode("utf-8")
+        except (UnicodeEncodeError, LookupError) as exc:
+            report.warnings.append(f"인코딩 실패로 건너뜀: {cand.file_path.name} {cand.path_text}: {exc}")
+            continue
+        cand.node.replacement_bytes = encoded
+        flag_node = cand.node.meta.get("ascii_flag_node")
+        if flag_node is not None and any(b > 127 for b in encoded):
+            flag_node.replacement_bytes = b"T"
+        if not ruby_enc and cand.node.encoding not in (None, "utf-8"):
+            non_utf8_sources += 1
+        applied += 1
+    if non_utf8_sources:
+        log(
+            f"주의: 원본 인코딩이 UTF-8이 아닌 문자열 {non_utf8_sources}개를 UTF-8로 저장합니다. "
+            "게임 화면에서 글자가 깨지면 백업을 복원하세요."
+        )
 
     log(f"적용할 문자열: {applied}개")
 
@@ -1670,7 +1760,10 @@ def translate_game(
     for wi, (f, data, root) in enumerate(modified_docs, 1):
         _progress("save", wi, len(modified_docs), f.name)
         patched = render_patched(data, root)
-        f.write_bytes(patched)
+        # Atomic write: a crash or forced exit mid-save must never leave a truncated file.
+        tmp_path = f.with_suffix(f.suffix + ".tmp")
+        tmp_path.write_bytes(patched)
+        tmp_path.replace(f)
         report.files_written += 1
         log(f"저장 완료: {f.name}")
 
@@ -1952,22 +2045,26 @@ class _Tooltip:
     def _show(self) -> None:
         if self.tip is not None:
             return
-        x = self.widget.winfo_rootx() + 14
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
-        tip = tk.Toplevel(self.widget)
-        tip.wm_overrideredirect(True)
-        tip.wm_geometry(f"+{x}+{y}")
-        tk.Label(
-            tip,
-            text=self.text,
-            justify="left",
-            wraplength=self.wraplength,
-            background="#22272e",
-            foreground="#f0f3f6",
-            padx=9,
-            pady=6,
-        ).pack()
-        self.tip = tip
+        try:
+            x = self.widget.winfo_rootx() + 14
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+            tip = tk.Toplevel(self.widget)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{x}+{y}")
+            tk.Label(
+                tip,
+                text=self.text,
+                justify="left",
+                wraplength=self.wraplength,
+                background="#22272e",
+                foreground="#f0f3f6",
+                padx=9,
+                pady=6,
+            ).pack()
+            self.tip = tip
+        except Exception:
+            # The widget/window can be destroyed between scheduling and firing.
+            self.tip = None
 
     def _hide(self, _event: Any = None) -> None:
         self._cancel()
@@ -2113,9 +2210,10 @@ class TranslatorApp:
 
     def _setup_icon(self) -> None:
         try:
+            # Always rewrite: rendering the small sizes is instant, and this avoids ever
+            # loading a stale/corrupt icon left in temp by an older version.
             ico_path = Path(tempfile.gettempdir()) / "rvx_gemini_translator.ico"
-            if not ico_path.exists():
-                ico_path.write_bytes(app_icon_ico_bytes())
+            ico_path.write_bytes(app_icon_ico_bytes())
             self.root.iconbitmap(default=str(ico_path))
         except Exception:
             try:
@@ -2339,7 +2437,9 @@ class TranslatorApp:
             self.instr_text.delete("1.0", "end")
             self.instr_text.insert("1.0", instructions)
         geometry = str(data.get("geometry", "") or "")
-        if re.fullmatch(r"\d+x\d+([+-]\d+[+-]\d+)?", geometry):
+        # Tk on Windows reports "+-N" offsets on secondary monitors, and -32000 when the
+        # window was closed while minimized — accept the former, reject the latter.
+        if re.fullmatch(r"\d+x\d+([+-]-?\d{1,5}[+-]-?\d{1,5})?", geometry) and "-32000" not in geometry:
             try:
                 self.root.geometry(geometry)
             except Exception:
@@ -2366,6 +2466,14 @@ class TranslatorApp:
         return data
 
     def _on_close(self) -> None:
+        if self._job_running() and not messagebox.askyesno(
+            APP_NAME,
+            "작업이 아직 진행 중입니다. 지금 종료하면 현재 처리 중인 내용이 중단될 수 있습니다.\n"
+            "정말 종료할까요?",
+            parent=self.root,
+        ):
+            return
+        self.cancel_event.set()
         save_settings(self._collect_settings())
         self.root.destroy()
 
@@ -2597,6 +2705,10 @@ class TranslatorApp:
                 elif kind == "progress":
                     self._on_progress_msg(*payload)
                 elif kind == "done":
+                    # A terminal message means the job is over even if the worker thread
+                    # is still in its final instructions; without this, _update_start_state
+                    # can see is_alive() and leave the buttons stuck disabled.
+                    self.worker = None
                     self._finish_job()
                     if self.job_kind == "translate":
                         self.progressbar.configure(value=100.0)
@@ -2605,6 +2717,7 @@ class TranslatorApp:
                     self.append_log(str(payload), "ok")
                     messagebox.showinfo(APP_NAME, str(payload), parent=self.root)
                 elif kind == "cancelled":
+                    self.worker = None
                     self._finish_job()
                     self.status_label.configure(text="중지됨")
                     self.append_log(
@@ -2618,6 +2731,7 @@ class TranslatorApp:
                         parent=self.root,
                     )
                 elif kind == "error":
+                    self.worker = None
                     self._finish_job()
                     msg = str(payload)
                     self.status_label.configure(text="오류")
@@ -2625,7 +2739,15 @@ class TranslatorApp:
                     messagebox.showerror(APP_NAME, msg.splitlines()[0] if msg else "오류", parent=self.root)
         except queue.Empty:
             pass
-        self.root.after(100, self._poll_queue)
+        except Exception:
+            # A handler exception (e.g. TclError during teardown) must never kill the
+            # polling loop, or logs/progress/completion would silently freeze.
+            pass
+        finally:
+            try:
+                self.root.after(100, self._poll_queue)
+            except Exception:
+                pass
 
     def run(self) -> None:
         self.root.mainloop()
