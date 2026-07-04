@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RPG Maker VX (.rvdata) Gemini auto translator.
+RPG Maker VX (.rvdata) / VX Ace (.rvdata2) Gemini auto translator.
 
-- Select a RPG Maker VX Game.exe.
-- Reads Data/*.rvdata Ruby Marshal files without Ruby.
+- Select a RPG Maker VX or VX Ace Game.exe.
+- Reads Data/*.rvdata and Data/*.rvdata2 Ruby Marshal files without Ruby.
 - Backs up Data first.
 - Translates likely player-visible strings through Gemini API.
-- Writes patched .rvdata files while preserving the original Marshal structure.
+- Writes patched files while preserving the original Marshal structure.
 
 Use only for games you are legally allowed to modify/translate.
 """
@@ -36,22 +36,25 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 APP_NAME = "RVX Gemini Translator"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 DEFAULT_MODEL = "gemini-3.1-flash-lite"
 
-# RPG Maker VX data files where translating strings is usually meaningful.
+# RPG Maker VX / VX Ace data files where translating strings is usually meaningful.
 SAFE_FILE_RE = re.compile(
-    r"^(Actors|Classes|Skills|Items|Weapons|Armors|Enemies|Troops|States|CommonEvents|MapInfos|System|Map\d{3})\.rvdata$",
+    r"^(Actors|Classes|Skills|Items|Weapons|Armors|Enemies|Troops|States|CommonEvents|MapInfos|System|Map\d{3})\.rvdata2?$",
     re.IGNORECASE,
 )
 
 # Files where changing strings tends to break scripts/assets or has little player-visible value.
 ALWAYS_SKIP_FILES = {
     "scripts.rvdata",
+    "scripts.rvdata2",
 }
 DEFAULT_SKIP_FILES = {
     "animations.rvdata",
     "areas.rvdata",
+    "animations.rvdata2",
+    "tilesets.rvdata2",
 }
 
 # Event command codes whose string parameters are player-visible in VX.
@@ -130,6 +133,8 @@ class TranslatorConfig:
     batch_size: int = 60
     batch_chars: int = 10000
     request_delay: float = 0.25
+    # Free-form user guidance appended to the system prompt (tone, style, honorifics...).
+    extra_instructions: str = ""
 
 
 @dataclasses.dataclass
@@ -561,6 +566,12 @@ def contains_excluded_asset_path(path_text: str) -> bool:
         "rpg::bgs.@name",
         "rpg::me.@name",
         "rpg::se.@name",
+        # VX Ace additions: numbered title/battleback graphics and tileset name lists.
+        "@title1_name",
+        "@title2_name",
+        "@battleback1_name",
+        "@battleback2_name",
+        "@tileset_names",
         "rpg::system.@sounds",
         "rpg::system.@title_bgm",
         "rpg::system.@battle_bgm",
@@ -629,10 +640,15 @@ def should_process_file(file_path: Path, process_all_files: bool) -> bool:
     if lower in ALWAYS_SKIP_FILES:
         return False
     if process_all_files:
-        return lower.endswith(".rvdata")
+        return lower.endswith((".rvdata", ".rvdata2"))
     if lower in DEFAULT_SKIP_FILES:
         return False
     return SAFE_FILE_RE.match(file_path.name) is not None
+
+
+def list_game_data_files(data_dir: Path) -> list[Path]:
+    """All VX (.rvdata) and VX Ace (.rvdata2) data files, sorted by name."""
+    return sorted([*data_dir.glob("*.rvdata"), *data_dir.glob("*.rvdata2")], key=lambda p: p.name.lower())
 
 
 def collect_candidates(
@@ -657,6 +673,34 @@ def collect_candidates(
         if should_translate_text(node.text, include_ascii=include_ascii):
             result.append(TextCandidate(node=node, file_path=file_path, text=node.text, path_text=path_text))
     return result
+
+
+def candidate_category_label(cand: TextCandidate) -> str:
+    """Korean category hint sent to Gemini so each string is translated in context."""
+    p = cand.path_text.lower()
+    code = cand.node.meta.get("event_code")
+    if isinstance(code, int):
+        if code in (401, 405):
+            return "대사"
+        if code in (102, 402):
+            return "선택지"
+        if code in (320, 324, 325):
+            return "이름"
+    if ".@name" in p or "@nickname" in p or "@display_name" in p:
+        return "이름"
+    if "@description" in p:
+        return "설명"
+    if (
+        "words.@" in p
+        or "terms.@" in p
+        or "@currency_unit" in p
+        or "@elements" in p
+        or "@skill_types" in p
+        or "@weapon_types" in p
+        or "@armor_types" in p
+    ):
+        return "용어"
+    return "기타"
 
 
 # ---------------------------------------------------------------------------
@@ -744,6 +788,7 @@ class GeminiBatchTranslator:
         target_lang: str,
         log: LogFn = print,
         debug_dir: Optional[Path] = None,
+        extra_instructions: str = "",
     ) -> None:
         self.api_key = api_key.strip()
         self.model = model.strip() or DEFAULT_MODEL
@@ -751,6 +796,11 @@ class GeminiBatchTranslator:
         self.target_lang = target_lang.strip() or "Korean"
         self.log = log
         self.debug_dir = debug_dir
+        self.extra_instructions = extra_instructions.strip()
+        # source text -> category hint ("대사", "이름", ...); set once per run by translate_game.
+        self.categories: dict[str, str] = {}
+        # source term -> fixed translation, built from the name pass; injected per batch.
+        self.glossary: dict[str, str] = {}
         if not self.api_key:
             raise ValueError("Gemini API 키가 비어 있습니다.")
         try:
@@ -860,7 +910,9 @@ class GeminiBatchTranslator:
             required_keys.append(str(local_no))
             # JSON-quoted text keeps one item per line even when the original string
             # contains quotes, backslashes, or line breaks.
-            input_lines.append(f"{local_no}: {json.dumps(protected, ensure_ascii=False)}")
+            category = self.categories.get(source, "")
+            prefix = f"{local_no} [{category}]" if category else str(local_no)
+            input_lines.append(f"{prefix}: {json.dumps(protected, ensure_ascii=False)}")
 
         schema = {
             "type": "object",
@@ -870,22 +922,49 @@ class GeminiBatchTranslator:
         }
 
         system_instruction = (
-            "You are a precise RPG Maker VX game localization engine. "
-            "The user will provide numbered strings. Translate every numbered string independently. "
+            "You are a professional game localization engine for RPG Maker VX / VX Ace games. "
+            f"Translate every numbered string independently into natural, fluent {self.target_lang} "
+            "that reads like an official game localization, not a literal machine translation. "
+            "Guidelines: dialogue should sound natural and colloquial for the speaker; item, skill, and enemy names "
+            "should be short and game-like; descriptions and system messages should use a concise, consistent register. "
+            "For Korean, use natural speech levels in dialogue and plain declarative style (~다/명사형) for "
+            "system messages and descriptions; keep honorifics consistent across lines. "
             "Preserve placeholders such as ⟦PH0⟧ exactly, preserve RPG Maker control sequences, "
-            "preserve line breaks by using JSON escapes, and do not add explanations. "
+            "preserve line breaks by using JSON escapes, and do not add explanations or translator notes. "
             "Return compact JSON only. Never use markdown code fences."
         )
+        if self.extra_instructions:
+            system_instruction += " Additional instructions from the user (follow them): " + self.extra_instructions
+
+        glossary_lines: list[str] = []
+        if self.glossary:
+            batch_texts = [all_sources[i] for i in indices]
+            for term, translated in self.glossary.items():
+                if len(glossary_lines) >= 60:
+                    break
+                if len(term) < 2:
+                    continue
+                if any(term in text and term != text for text in batch_texts):
+                    glossary_lines.append(f"- {json.dumps(term, ensure_ascii=False)} -> {json.dumps(translated, ensure_ascii=False)}")
+
         src_desc = "the detected source language" if self.source_lang.lower() == "auto" else self.source_lang
         prompt = (
             f"Translate each numbered item from {src_desc} to {self.target_lang}.\n"
+            "Each input line looks like `number [category]: \"text\"`. The category is context for you: "
+            "대사=dialogue line, 선택지=player choice, 이름=proper noun/name, 설명=description, "
+            "용어=system term, 기타=other. Translate each item according to its category.\n"
             "Return exactly one compact JSON object. Keys must be the item numbers as strings. "
             "Values must be the translated strings. Do not omit, merge, split, renumber, or reorder items. "
             "If an item should stay unchanged, return it unchanged. "
             "Do not wrap the result in ```json or any markdown. Escape literal line breaks as \\n inside JSON strings.\n"
-            f"Required keys: {', '.join(required_keys)}\n\n"
-            "Items:\n" + "\n".join(input_lines)
         )
+        if glossary_lines:
+            prompt += (
+                "Glossary — when these terms appear inside an item, always use these exact translations:\n"
+                + "\n".join(glossary_lines)
+                + "\n"
+            )
+        prompt += f"Required keys: {', '.join(required_keys)}\n\nItems:\n" + "\n".join(input_lines)
 
         config: dict[str, Any] = {
             "system_instruction": system_instruction,
@@ -1309,7 +1388,7 @@ def repair_asset_references(
     parsed_to_write: list[tuple[Path, bytes, MarshalNode, int]] = []
     restored_nodes = 0
 
-    for current_file in sorted(data_dir.glob("*.rvdata")):
+    for current_file in list_game_data_files(data_dir):
         backup_file = source_backup / current_file.name
         if not backup_file.exists():
             continue
@@ -1412,10 +1491,10 @@ def translate_game(
     game_dir, data_dir = validate_config(config)
     report = TranslationReport(game_dir=game_dir, data_dir=data_dir, backup_dir=None)
 
-    rvdata_files = sorted(data_dir.glob("*.rvdata"))
+    rvdata_files = list_game_data_files(data_dir)
     report.files_seen = len(rvdata_files)
     if not rvdata_files:
-        raise FileNotFoundError(f".rvdata 파일이 없습니다: {data_dir}")
+        raise FileNotFoundError(f".rvdata/.rvdata2 파일이 없습니다: {data_dir}")
 
     selected_files: list[Path] = []
     for f in rvdata_files:
@@ -1424,7 +1503,7 @@ def translate_game(
         else:
             report.skipped_files.append(f.name)
     if not selected_files:
-        raise RuntimeError("처리할 .rvdata 파일이 없습니다. '모든 rvdata 처리' 옵션을 켜 보세요.")
+        raise RuntimeError("처리할 .rvdata/.rvdata2 파일이 없습니다. '모든 데이터 파일 처리' 옵션을 켜 보세요.")
 
     log(f"처리 대상 파일: {len(selected_files)}개 / 전체 {len(rvdata_files)}개")
 
@@ -1461,10 +1540,13 @@ def translate_game(
 
     unique_sources: list[str] = []
     seen: set[str] = set()
+    categories: dict[str, str] = {}
     for cand in all_candidates:
         if cand.text not in seen:
             unique_sources.append(cand.text)
             seen.add(cand.text)
+        if cand.text not in categories:
+            categories[cand.text] = candidate_category_label(cand)
     report.unique_texts = len(unique_sources)
     log(f"번역 후보: 전체 {report.candidates}개, 고유 문자열 {report.unique_texts}개")
 
@@ -1494,15 +1576,30 @@ def translate_game(
             target_lang=config.target_lang,
             log=log,
             debug_dir=game_dir / ".rvx_gemini_cache" / "bad_responses",
+            extra_instructions=config.extra_instructions,
         )
-        batches = make_batches(to_translate, max_items=config.batch_size, max_chars=config.batch_chars)
+        translator.categories = categories
+
+        # Two passes: names/proper nouns first, then everything else with the resulting
+        # glossary injected, so the same character/item name is translated identically
+        # inside dialogue and descriptions.
+        name_sources = [s for s in to_translate if categories.get(s) == "이름"]
+        other_sources = [s for s in to_translate if categories.get(s) != "이름"]
+        name_batches = make_batches(name_sources, max_items=config.batch_size, max_chars=config.batch_chars)
+        other_batches = make_batches(other_sources, max_items=config.batch_size, max_chars=config.batch_chars)
+        total_batches = len(name_batches) + len(other_batches)
         log(f"Gemini 요청 방식: 번호 매핑 묶음 요청 / 배치당 최대 {config.batch_size}개, 약 {config.batch_chars}자")
-        for bi, batch in enumerate(batches, 1):
+
+        bi = 0
+
+        def run_batch(batch: list[str]) -> None:
+            nonlocal bi
+            bi += 1
             # Checked before each request: the previous batch's cache.save() has already
             # run, so a cancel here loses nothing and the next run resumes from cache.
             _check_cancel()
-            _progress("translate", bi - 1, len(batches), f"배치 {bi}/{len(batches)} ({len(batch)}개)")
-            log(f"Gemini 번역 중: 배치 {bi}/{len(batches)} - {len(batch)}개")
+            _progress("translate", bi - 1, total_batches, f"배치 {bi}/{total_batches} ({len(batch)}개)")
+            log(f"Gemini 번역 중: 배치 {bi}/{total_batches} - {len(batch)}개")
             batch_result = translator.translate_batch(batch)
             if len(batch_result) < len(batch):
                 log(f"주의: 배치 {bi}에서 {len(batch) - len(batch_result)}개 문자열은 번역하지 못해 원문으로 유지됩니다. 재실행하면 캐시된 항목은 건너뛰고 남은 항목만 다시 시도합니다.")
@@ -1512,12 +1609,34 @@ def translate_game(
                 cache.set(key, src, dst)
                 report.translated_now += 1
             cache.save()
-            _progress("translate", bi, len(batches), f"배치 {bi}/{len(batches)} 완료")
-            if config.request_delay > 0 and bi < len(batches):
+            _progress("translate", bi, total_batches, f"배치 {bi}/{total_batches} 완료")
+            if config.request_delay > 0 and bi < total_batches:
                 if cancel is not None:
                     cancel.wait(config.request_delay)
                 else:
                     time.sleep(config.request_delay)
+
+        if name_batches:
+            log(f"1단계: 이름/고유명사 {len(name_sources)}개 번역 (배치 {len(name_batches)}개)")
+        for batch in name_batches:
+            run_batch(batch)
+
+        # Cached name translations also feed the glossary, so re-runs stay consistent.
+        glossary: dict[str, str] = {}
+        for src_text, category in categories.items():
+            if category != "이름":
+                continue
+            translated = translations.get(src_text)
+            if translated and translated != src_text:
+                glossary[src_text.strip()] = translated.strip()
+        translator.glossary = glossary
+        if glossary:
+            log(f"용어집 구성 완료: {len(glossary)}개 항목 (이후 배치에 일관성 적용)")
+
+        if other_batches:
+            log(f"2단계: 대사/설명/용어 {len(other_sources)}개 번역 (배치 {len(other_batches)}개)")
+        for batch in other_batches:
+            run_batch(batch)
 
     # Apply translations to nodes. Encode all translated text as UTF-8; RPG Maker VX .rvdata normally accepts UTF-8 strings.
     applied = 0
@@ -2097,13 +2216,37 @@ class TranslatorApp:
         checks = (
             (self.include_ascii_var, "영어/ASCII 문자열도 번역", "영어 등 ASCII로만 된 문자열도 번역 대상에 포함합니다."),
             (self.internal_var, "내부 이름도 번역", "스위치/변수 이름 등 플레이어에게 보이지 않는 내부 이름도 번역합니다. 보통 꺼두는 것을 권장합니다."),
-            (self.all_files_var, "모든 .rvdata 처리 (위험)", "Scripts.rvdata를 제외한 모든 .rvdata 파일을 처리합니다. 예상하지 못한 파일까지 수정될 수 있어 위험합니다."),
+            (self.all_files_var, "모든 데이터 파일 처리 (위험)", "Scripts를 제외한 모든 .rvdata/.rvdata2 파일을 처리합니다. 예상하지 못한 파일까지 수정될 수 있어 위험합니다."),
             (self.dry_run_var, "드라이런 (파일 변경 없음)", "Gemini 요청과 파일 쓰기 없이 번역 후보만 스캔해 보고서를 만듭니다. API 키 없이 사용할 수 있습니다."),
         )
         for i, (var, label, tip) in enumerate(checks):
             chk = ttk.Checkbutton(opts, text=label, variable=var)
             chk.grid(row=1 + i // 2, column=i % 2, sticky="w", padx=(0, px(24)), pady=(px(7), 0))
             _Tooltip(chk, tip)
+
+        opts.columnconfigure(1, weight=1)
+        instr_label = ttk.Label(opts, text="번역 지침 (선택)", style="Card.TLabel")
+        instr_label.grid(row=3, column=0, sticky="w", pady=(px(10), px(3)))
+        self.instr_text = tk.Text(
+            opts,
+            height=2,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=_UI_BORDER,
+            highlightcolor=_UI_ACCENT,
+            background="#fbfcfe",
+            foreground=_UI_TEXT,
+            insertbackground=_UI_TEXT,
+            font=tkfont.nametofont("TkDefaultFont"),
+            wrap="word",
+        )
+        self.instr_text.grid(row=4, column=0, columnspan=2, sticky="ew")
+        _Tooltip(
+            instr_label,
+            "번역 톤/문체 지침을 자유롭게 적으면 모든 번역 요청에 함께 전달됩니다.\n"
+            "예: 주인공 '유리'는 밝은 반말, 집사 '한스'는 극존댓말. 게임 배경은 중세 판타지.",
+        )
 
         # --- action row ---
         action = ttk.Frame(main)
@@ -2191,6 +2334,10 @@ class TranslatorApp:
         env_key = os.environ.get("GEMINI_API_KEY", "").strip()
         saved_key = str(data.get("api_key", "") or "") if self.save_api_var.get() else ""
         self.api_var.set(env_key or saved_key)
+        instructions = str(data.get("extra_instructions", "") or "")
+        if instructions:
+            self.instr_text.delete("1.0", "end")
+            self.instr_text.insert("1.0", instructions)
         geometry = str(data.get("geometry", "") or "")
         if re.fullmatch(r"\d+x\d+([+-]\d+[+-]\d+)?", geometry):
             try:
@@ -2211,6 +2358,7 @@ class TranslatorApp:
             "process_all_files": self.all_files_var.get(),
             "dry_run": self.dry_run_var.get(),
             "save_api_key": self.save_api_var.get(),
+            "extra_instructions": self.instr_text.get("1.0", "end").strip(),
             "geometry": self.root.geometry(),
         }
         if self.save_api_var.get():
@@ -2273,7 +2421,7 @@ class TranslatorApp:
 
     def _browse_exe(self) -> None:
         path = filedialog.askopenfilename(
-            title="RPG Maker VX Game.exe 선택",
+            title="RPG Maker VX / VX Ace Game.exe 선택",
             filetypes=[("EXE files", "*.exe"), ("All files", "*.*")],
         )
         if path:
@@ -2335,6 +2483,7 @@ class TranslatorApp:
                 dry_run=self.dry_run_var.get(),
                 batch_size=max(1, int(self.batch_size_var.get() or "60")),
                 batch_chars=max(1000, int(self.batch_chars_var.get() or "10000")),
+                extra_instructions=self.instr_text.get("1.0", "end").strip(),
             )
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc), parent=self.root)
@@ -2495,14 +2644,15 @@ def run_gui() -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=f"{APP_NAME} {APP_VERSION}")
-    p.add_argument("--exe", type=Path, help="RPG Maker VX Game.exe 경로")
+    p.add_argument("--exe", type=Path, help="RPG Maker VX/VX Ace Game.exe 경로")
     p.add_argument("--api-key", default=os.environ.get("GEMINI_API_KEY", ""), help="Gemini API 키")
     p.add_argument("--model", default=DEFAULT_MODEL, help=f"Gemini 모델 ID (기본: {DEFAULT_MODEL})")
     p.add_argument("--source", default="auto", help="원문 언어 (기본: auto)")
     p.add_argument("--target", default="Korean", help="대상 언어 (기본: Korean)")
     p.add_argument("--no-ascii", action="store_true", help="ASCII/영어처럼 보이는 문자열은 건너뜀")
     p.add_argument("--include-internal", action="store_true", help="스위치/변수 등 내부 이름도 번역")
-    p.add_argument("--all-files", action="store_true", help="Scripts 제외 모든 .rvdata 처리(위험)")
+    p.add_argument("--all-files", action="store_true", help="Scripts 제외 모든 .rvdata/.rvdata2 처리(위험)")
+    p.add_argument("--instructions", default="", help="추가 번역 지침 (톤/문체/등장인물 말투 등)")
     p.add_argument("--dry-run", action="store_true", help="스캔만 하고 Gemini 요청/파일 쓰기 안 함")
     p.add_argument("--batch-size", type=int, default=60, help="Gemini 요청당 최대 문자열 수")
     p.add_argument("--batch-chars", type=int, default=10000, help="Gemini 요청당 대략 최대 글자 수")
@@ -2559,6 +2709,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         dry_run=args.dry_run,
         batch_size=max(1, args.batch_size),
         batch_chars=max(1000, args.batch_chars),
+        extra_instructions=args.instructions,
     )
     try:
         translate_game(cfg, log=print)
