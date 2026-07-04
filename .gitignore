@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+app.ico
+
+# Runtime cache (created next to the translated game, but just in case)
+.rvx_gemini_cache/
+Data_backup_before_gemini_*/
+rvx_gemini_translation_report_*.txt
