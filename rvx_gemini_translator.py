@@ -36,8 +36,21 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 APP_NAME = "RVX Gemini Translator"
-APP_VERSION = "0.3.1"
-DEFAULT_MODEL = "gemini-3.1-flash-lite"
+APP_VERSION = "0.3.2"
+DEFAULT_MODEL = "gemini-3.5-flash"
+# Model ids confirmed retired from the API (exact match); saved settings using these
+# are migrated to DEFAULT_MODEL. Note gemini-3.1-flash-lite is still served.
+RETIRED_MODELS = {"gemini-3.1-flash"}
+# Offline fallback list for the dropdown; the "모델 불러오기" button replaces it with
+# the live list from ModelService.ListModels.
+FALLBACK_MODEL_CHOICES = (
+    DEFAULT_MODEL,
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash",
+)
 
 # RPG Maker VX / VX Ace data files where translating strings is usually meaningful.
 SAFE_FILE_RE = re.compile(
@@ -835,6 +848,23 @@ class TranslationCache:
         tmp.replace(self.path)
 
 
+def list_gemini_models(api_key: str) -> list[str]:
+    """Gemini model ids that support generateContent, via ModelService.ListModels."""
+    from google import genai  # type: ignore
+
+    client = genai.Client(api_key=api_key.strip())
+    names: set[str] = set()
+    for model in client.models.list():
+        name = (getattr(model, "name", "") or "").removeprefix("models/")
+        if not name.startswith("gemini"):
+            continue
+        actions = getattr(model, "supported_actions", None)
+        if actions and "generateContent" not in actions:
+            continue
+        names.add(name)
+    return sorted(names)
+
+
 class GeminiBatchTranslator:
     def __init__(
         self,
@@ -1024,7 +1054,8 @@ class GeminiBatchTranslator:
             "response_mime_type": "application/json",
             "response_json_schema": schema,
             "temperature": 0.1,
-            # Gemini 3.1 Flash-Lite supports minimal thinking; this keeps bulk translation low-latency.
+            # Minimal thinking keeps bulk translation low-latency; the config fallback
+            # ladder below drops this automatically on models that reject it.
             "thinking_config": {"thinking_level": "minimal"},
         }
 
@@ -1098,6 +1129,14 @@ class GeminiBatchTranslator:
                     last_exc = exc
                     msg = str(exc)
                     lower_msg = msg.lower()
+                    # A missing/retired model id can never succeed — abort everything at
+                    # once instead of burning the whole retry/fallback ladder on it.
+                    if "not_found" in lower_msg or ("404" in lower_msg and "not found" in lower_msg):
+                        raise RuntimeError(
+                            f"모델 '{self.model}'을(를) API에서 찾을 수 없습니다 (404). "
+                            "모델이 단종되었을 수 있습니다. GUI의 '모델 불러오기' 버튼으로 "
+                            f"사용 가능한 모델을 확인해 선택하세요. 원본 오류: {msg[:200]}"
+                        ) from exc
                     # If the SDK/API rejects a non-essential config field, immediately
                     # move to the next simpler config instead of wasting retries.
                     if "additionalproperties" in lower_msg and "response_json_schema" in cfg:
@@ -2275,12 +2314,15 @@ class TranslatorApp:
         )
 
         ttk.Label(api, text="모델", style="Card.TLabel").grid(row=2, column=0, sticky="w", padx=(0, px(10)), pady=(px(8), 0))
-        model_box = ttk.Combobox(
-            api,
-            textvariable=self.model_var,
-            values=(DEFAULT_MODEL, "gemini-3.1-flash", "gemini-2.5-flash-lite", "gemini-2.5-flash"),
+        self.model_box = ttk.Combobox(api, textvariable=self.model_var, values=FALLBACK_MODEL_CHOICES)
+        self.model_box.grid(row=2, column=1, sticky="ew", pady=(px(8), 0))
+        self.model_refresh_btn = ttk.Button(api, text="모델 불러오기", command=self._load_models)
+        self.model_refresh_btn.grid(row=2, column=2, columnspan=2, sticky="w", padx=(px(8), 0), pady=(px(8), 0))
+        _Tooltip(
+            self.model_refresh_btn,
+            "입력한 API 키로 현재 사용 가능한 Gemini 모델 목록을 조회해 드롭다운을 채웁니다.\n"
+            "모델을 찾을 수 없다는(404) 오류가 나면 이 버튼으로 최신 목록을 확인하세요.",
         )
-        model_box.grid(row=2, column=1, sticky="ew", pady=(px(8), 0))
 
         lang_row = ttk.Frame(api, style="CardInner.TFrame")
         lang_row.grid(row=3, column=1, sticky="w", pady=(px(8), 0))
@@ -2419,7 +2461,10 @@ class TranslatorApp:
     def _load_settings(self) -> None:
         data = load_settings()
         self.exe_var.set(str(data.get("exe_path", "") or ""))
-        self.model_var.set(str(data.get("model", DEFAULT_MODEL) or DEFAULT_MODEL))
+        saved_model = str(data.get("model", DEFAULT_MODEL) or DEFAULT_MODEL)
+        if saved_model in RETIRED_MODELS:
+            saved_model = DEFAULT_MODEL
+        self.model_var.set(saved_model)
         self.source_var.set(str(data.get("source_lang", "auto") or "auto"))
         self.target_var.set(str(data.get("target_lang", "Korean") or "Korean"))
         self.batch_size_var.set(str(data.get("batch_size", 60) or 60))
@@ -2539,6 +2584,22 @@ class TranslatorApp:
         self._api_hidden = not self._api_hidden
         self.api_entry.configure(show=("•" if self._api_hidden else ""))
         self.api_toggle_btn.configure(text=("표시" if self._api_hidden else "숨김"))
+
+    def _load_models(self) -> None:
+        api_key = self.api_var.get().strip()
+        if not api_key:
+            messagebox.showinfo(APP_NAME, "먼저 Gemini API 키를 입력하세요.", parent=self.root)
+            return
+        self.model_refresh_btn.configure(state="disabled")
+        self.append_log("사용 가능한 모델 목록을 불러오는 중...")
+
+        def job() -> None:
+            try:
+                self.q.put(("models", list_gemini_models(api_key)))
+            except Exception as exc:
+                self.q.put(("models_error", str(exc)))
+
+        threading.Thread(target=job, daemon=True).start()
 
     def _ui_log(self, msg: str) -> None:
         self.q.put(("log", msg))
@@ -2704,6 +2765,20 @@ class TranslatorApp:
                     self.append_log(str(payload))
                 elif kind == "progress":
                     self._on_progress_msg(*payload)
+                elif kind == "models":
+                    self.model_refresh_btn.configure(state="normal")
+                    names = list(payload)
+                    if names:
+                        self.model_box.configure(values=names)
+                        shown = ", ".join(names[:8]) + ("..." if len(names) > 8 else "")
+                        self.append_log(f"사용 가능한 모델 {len(names)}개 확인: {shown}")
+                        if self.model_var.get().strip() not in names:
+                            self.append_log("주의: 현재 입력된 모델이 목록에 없습니다. 드롭다운에서 선택하세요.")
+                    else:
+                        self.append_log("주의: 사용 가능한 Gemini 모델을 찾지 못했습니다.")
+                elif kind == "models_error":
+                    self.model_refresh_btn.configure(state="normal")
+                    self.append_log(f"오류: 모델 목록을 불러오지 못했습니다: {payload}")
                 elif kind == "done":
                     # A terminal message means the job is over even if the worker thread
                     # is still in its final instructions; without this, _update_start_state
@@ -2782,6 +2857,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--repair-assets", action="store_true", help="백업 기준으로 오디오/그래픽 파일명 참조만 복구")
     p.add_argument("--backup-dir", type=Path, help="복원/자산명 복구에 사용할 백업 Data 폴더 경로")
     p.add_argument("--gui", action="store_true", help="GUI 실행")
+    p.add_argument("--list-models", action="store_true", help="사용 가능한 Gemini 모델 목록 출력 (API 키 필요)")
     p.add_argument("--write-icon", type=Path, metavar="PATH", help="앱 아이콘 .ico 파일을 생성하고 종료 (빌드용)")
     return p
 
@@ -2792,6 +2868,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         try:
             path = write_icon_file(args.write_icon)
             print(f"아이콘 저장: {path}")
+            return 0
+        except Exception as exc:
+            print(f"오류: {exc}", file=sys.stderr)
+            return 1
+    if args.list_models:
+        if not args.api_key:
+            print("오류: --list-models에는 --api-key 또는 GEMINI_API_KEY 환경변수가 필요합니다.", file=sys.stderr)
+            return 1
+        try:
+            for name in list_gemini_models(args.api_key):
+                print(name)
             return 0
         except Exception as exc:
             print(f"오류: {exc}", file=sys.stderr)
